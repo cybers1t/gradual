@@ -6,7 +6,7 @@ namespace Gradual
 
 /-- Set of Runtime kinds -/
 inductive RuntimeTy | int | bool
-deriving DecidableEq, Inhabited
+deriving DecidableEq, Inhabited, Repr
 
 
 /-- Runtime kinds to Lean types -/
@@ -74,25 +74,36 @@ inductive Error where
 | expectedArrTyForApp (f : Expr) (tFound : Ty)
 | invalidCast (e : Expr) (eTy : Ty) (expectedTy : Ty)
 | unexpectedCastInSurfaceLang (e : Expr) (eTy : Ty)
+| incorrectBVar (i : BVarId)
 
 
 structure State where 
   errors : Array Error
+  bvar2ty : HashMap BVarId Ty
+  nbinders : BVarId -- Id of the next bvar we will produce
 
 abbrev GradualM (α : Type) : Type := StateT State IO α
 
 namespace GradualM
 
-def lookupBvarTy (i : BVarId) : GradualM Ty := sorry
-def withBVarTy (ty : Ty) (k : GradualM α) : GradualM α := sorry
-def lookupFvarTy (i : FVarId) : GradualM Ty := sorry
-def addBvar (t : Ty) (k : BVarId → GradualM α) : GradualM α := sorry
 def logError (e : Error) : GradualM Unit := do
   modify fun s => { s with errors := s.errors.push e }
 
 def throw (e : Error) (a : α) : GradualM α := do
   logError e
   return a
+
+def lookupBvarTy (i : BVarId) : GradualM Ty := do
+  let s ← get 
+  match s.bvar2ty.find? i with
+  | .none => throw (.incorrectBVar i) .dyn
+  | .some ty => return ty
+
+def withBVarTy (ty : Ty) (k : GradualM α) : GradualM α := do
+ modify fun s => { s with bvar2ty := s.bvar2ty.insert s.nbinders ty, nbinders := s.nbinders + 1 }
+ let out ← k 
+ modify fun s => { s with nbinders := s.nbinders - 1 }
+ return out
 
 -- | See that this function is a mix of type inference and cast insertion
 def cast (e : Expr) : GradualM (Expr × Ty) := 
@@ -186,16 +197,20 @@ def subst (body : Expr) (val : Expr) : Expr :=
 
 def SimpleVal.tryCast? (v : SimpleVal) (t : Ty) : Error ⊕ SimpleVal :=
   match (v, t) with
-  | (.int v, .static .int) => .inr <| .int v
-  | (.int v, .dyn) => .inr <| .int v
-  | (.int v, _) => .inl <| s!"expected int/dyn cast for value {v}, found cast to {t}"
-  | (.bool b, .static .bool) => .inr <| .bool b
+  | (.int v, .static .int) => .inr <| .int v -- ECSTG
+  | (.int v, .dyn) => .inr <| .int v 
+  | (.int i, _) => .inl <| s!"expected int/dyn cast for value '{i}', found cast to {t}"
+  | (.bool b, .static .bool) => .inr <| .bool b -- ECSTG
   | (.bool b, .dyn) => .inr <| .bool b
   -- | TODO: how to typecheck this, mofos?
-  | (.bool b, _) => .inl <| s!"expected int/dyn cast for value {v}, found cast to {t}"
+  | (.bool b, _) => .inl <| s!"expected int/dyn cast for value '{b}', found cast to {t}"
   | (.lam i body, .dyn) => .inr <| .lam i body
-  -- | TODO: how to typecheck this, mofos?
-  | (.lam i body, .arr _ai _ao) => .inr <| .lam i body -- TODO:
+  -- push cast inside.
+  | (.lam i body, .arr ai ao) =>  -- ECSTF
+     -- adapt the casts
+     let x' := .cast (.bvar 0) ai
+     let body' := .cast body ao
+     .inr <| .lam i (.app body' x')
   -- | TODO: how to typecheck this, mofos?
   | (.lam _i _body, _) => .inl <| s!"expected int/dyn cast for value {v}, found cast to {t}"    
 
