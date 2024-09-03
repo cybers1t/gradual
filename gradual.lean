@@ -19,7 +19,21 @@ inductive Ty
 | static (k : RuntimeTy)
 | dyn
 | arr (i o : Ty)
-deriving DecidableEq, Inhabited
+deriving DecidableEq, Inhabited, Repr
+
+  -- (a -> (b -> c)) ~= a -> b -> c
+  -- (a -> (b -> (c -> d)) ~= a -> b -> c -> d
+  -- ((a -> b) -> c) ~= (a -> b) -> c
+  def Ty.toString (isLeftOfArr: Bool := false) : Ty → String
+  | .static .int => "int"
+  | .static .bool => "bool"
+  | .dyn => "⋆"
+  | .arr i o => 
+     let str := s!"{i.toString true} → {o.toString false}"
+     if isLeftOfArr then s!"({str})" else str
+
+instance : ToString Ty where
+  toString := Ty.toString
 
 instance : Coe RuntimeTy Ty where coe := .static
 
@@ -46,11 +60,10 @@ inductive Expr
 | bool (b: Bool)
 | int (i : Int)
 | bvar (i : BVarId) -- de bruijn indexed variables.
-| fvar (name : FVarId) -- free variables.
 | lam (i : Ty := .dyn) (e : Expr) -- lambda
 | app (f x : Expr) -- function application
 | cast (e : Expr) (t : Ty) -- `cast e to t`.
-deriving DecidableEq, Inhabited
+deriving DecidableEq, Inhabited, Repr
 
 structure Toplevel where
   defs : HashMap FVarId Expr  -- toplevel function definitions.
@@ -86,7 +99,6 @@ def cast (e : Expr) : GradualM (Expr × Ty) :=
   match e with
   | Expr.bool _ => return (e, .bool)
   | Expr.int _ => return (e, .int)
-  | Expr.fvar f => return (e, ← lookupFvarTy f)
   | Expr.cast e t => 
     throw (.unexpectedCastInSurfaceLang e t) (e, t)
   | .bvar i => return (e, ← lookupBvarTy i) -- CVAR
@@ -116,87 +128,103 @@ end CastInsertion
 
 namespace Eval
 
-/-- Expression contexts, in the fine grained call by value style -/
-inductive ExprCtx (α : Type)
-| appArg (f : Expr) (x : ExprCtx α) -- f [x]
-| appFn (f : ExprCtx α) (x : α) -- [f] v
-| castEnter (e : ExprCtx α) (t : Ty)
-| castExit (x : α)
-| hole (a : α) : ExprCtx α
 
 inductive Evaluable
 | bool (b : Bool)
 | int (i : Int)
 | bvar (i : BVarId)
-| fvar (i : FVarId)
 | lam (ity : Ty) (body : Expr)
-
-
-/-- Convert an expression into an expression context to be evaluated -/
-def Expr.startEvaluation : Expr → ExprCtx Evaluable
-| .bool b => .hole (.bool b)
-| .int i => .hole (.int i)
-| .bvar i => .hole (.bvar i)
-| .fvar i => .hole (.fvar i)
-| .lam i body => .hole (.lam i body)
-| .app f x => .appArg f (Expr.startEvaluation x)
-| .cast e t => .castEnter (Expr.startEvaluation e) t
 
 inductive SimpleVal
 | int (i : Int)
 | bool (b : Bool)
-| cls (e : List (BVarId × SimpleVal)) -- can't use a hashmap because Lean kernel is a wimp.
+| lam (i : Ty) (e : Expr)
+deriving DecidableEq, Repr
 
-def Evaluable.Evaluate : Evaluable → SimpleVal
-| .int i => .int i
-| .bool b => .bool b 
-| .bvar i => sorry 
-| .fvar f => sorry 
 
-inductive Error
-| invalidUnbox (v : SimpleVal × Ty) (expected : Ty)
-| stackEmptyForValue
-| stackStillHasContinuations
+
+/-- Expression contexts, in the fine grained call by value style -/
+inductive ExprCtx 
+| evalArg (f : Expr) 
+| evalFn (x : SimpleVal) -- [f] v
+| evalCast  (t : Ty)
+
+abbrev Error := String
 
 structure State where
-  cur : Evaluable
-  stack : List (ExprCtx Unit) -- current continuation
-  error? : Option Error -- error.
-  val? : Option Val -- evaluated value.
+  cur? : Expr ⊕ SimpleVal
+  stack : List (ExprCtx ) -- current continuation
+  error? : Option String
+  finalVal? : Option SimpleVal
 
 def State.setErr (s : State) (e : Error)  : State :=
   { s with error? := .some e }
 
-abbrev EvalM : Type → Type := IO
+abbrev EvalM := StateT State IO
 
-structure Val where
-  cast? : Option Ty
-  val : SimpleVal
+inductive Result (ε α : Type)
+| ok (a : α)
+| err (e : ε)
 
-def Val.ofSimpleVal (val : SimpleVal) : Val := { cast? := none, val := val }
+def SimpleVal.toExpr : SimpleVal → Expr 
+| .int i => .int i
+| .bool b => .bool b
+| .lam i b => .lam i b
 
-instance : Coe SimpleVal Val where coe := Val.ofSimpleVal
-
-namespace EvalM
-
-/-- take a single step in the machine. -/
-def step (s : State) : EvalM State :=
-  match s.error? with
-  | .some error => s
-  | .none => do -- not stuck, take a step.
-     let v ← s.cur.evaluate
-
-
-    match s.stack with
-    | [] => .stackEmptyForValue
-            
-          
-
+instance : ToString SimpleVal where
+  toString v := Format.pretty <| repr v
   
 
+def subst (body : Expr) (val : Expr) : Expr := 
+  match body with
+  | .bool b => .bool b
+  | .int i => .int i
+  | .bvar i => if i = 0 then val else .bvar (i - 1)
+  | .lam i b => .lam i (subst b val)
+  | .app f x => .app (subst f val) (subst x val)
+  | .cast e ty => .cast (subst e val) ty
 
-end EvalM
-end Eval
+def SimpleVal.tryCast? (v : SimpleVal) (t : Ty) : Error ⊕ SimpleVal :=
+  match (v, t) with
+  | (.int v, .static .int) => .inr <| .int v
+  | (.int v, .dyn) => .inr <| .int v
+  | (.int v, _) => .inl <| s!"expected int/dyn cast for value {v}, found cast to {t}"
+  | (.bool b, .static .bool) => .inr <| .bool b
+  | (.bool b, .dyn) => .inr <| .bool b
+  -- | TODO: how to typecheck this, mofos?
+  | (.bool b, _) => .inl <| s!"expected int/dyn cast for value {v}, found cast to {t}"
+  | (.lam i body, .dyn) => .inr <| .lam i body
+  -- | TODO: how to typecheck this, mofos?
+  | (.lam i body, .arr ai ao) => .inr <| .lam i body -- TODO:
+  -- | TODO: how to typecheck this, mofos?
+  | (.lam i body, _) => .inl <| s!"expected int/dyn cast for value {v}, found cast to {t}"    
+
+def evalCur : EvalM Unit := do
+  match (← get).cur? with
+  | .inl expr => 
+     match expr with
+     | .bool b => modify fun s => { s with cur? := .inr <| .bool b }
+     | .int i => modify fun s => { s with cur? := .inr <| .int i }
+     | .bvar _ => modify fun s => { s with error? := "found illegal bvar {expr}" }
+     | .lam i e => modify fun s => { s with cur? := .inr <| .lam i e } 
+     | .app f x => modify fun s => { s with cur? := .inl x, stack := .evalArg f :: s.stack }
+     | .cast e t => modify fun s => { s with cur? := .inl e, stack := .evalCast t :: s.stack }
+  | .inr val => 
+      -- | TODO: write a `pop` fun.
+      match (← get).stack with
+      | [] => modify fun s => { s with finalVal? := val, stack := s.stack }
+      | k :: ks => 
+         match (k, val) with
+         | (.evalArg f, v) => modify fun s => { s with cur? := .inl f, stack := .evalFn v :: s.stack }
+         | (.evalFn x, v) => 
+           match v with
+           | .lam ity body =>
+              modify fun s => { s with cur? := .inl <| subst body v.toExpr, stack := s.stack }
+           | _ => modify fun s => { s with error? := "expected lambda, found non-lambda on the stack" }
+         | (.evalCast t, v) =>
+             match v.tryCast t with
+             | .some v' => sorry -- TODO: what to do with lambdas?
+             | .none => sorry
 
 end Gradual
 def foo : IO Unit := return ()
