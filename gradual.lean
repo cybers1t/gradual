@@ -195,11 +195,13 @@ def SimpleVal.tryCast? (v : SimpleVal) (t : Ty) : Error ⊕ SimpleVal :=
   | (.bool b, _) => .inl <| s!"expected int/dyn cast for value {v}, found cast to {t}"
   | (.lam i body, .dyn) => .inr <| .lam i body
   -- | TODO: how to typecheck this, mofos?
-  | (.lam i body, .arr ai ao) => .inr <| .lam i body -- TODO:
+  | (.lam i body, .arr _ai _ao) => .inr <| .lam i body -- TODO:
   -- | TODO: how to typecheck this, mofos?
-  | (.lam i body, _) => .inl <| s!"expected int/dyn cast for value {v}, found cast to {t}"    
+  | (.lam _i _body, _) => .inl <| s!"expected int/dyn cast for value {v}, found cast to {t}"    
 
 def evalCur : EvalM Unit := do
+  -- don't proceed to evaluate in case we have an error.
+  if let .some _ := (← get).error? then return ()
   match (← get).cur? with
   | .inl expr => 
      match expr with
@@ -214,17 +216,17 @@ def evalCur : EvalM Unit := do
       match (← get).stack with
       | [] => modify fun s => { s with finalVal? := val, stack := s.stack }
       | k :: ks => 
-         match (k, val) with
-         | (.evalArg f, v) => modify fun s => { s with cur? := .inl f, stack := .evalFn v :: s.stack }
-         | (.evalFn x, v) => 
-           match v with
-           | .lam ity body =>
-              modify fun s => { s with cur? := .inl <| subst body v.toExpr, stack := s.stack }
+         match k with
+         | .evalArg f  => modify fun s => { s with cur? := .inl f, stack := .evalFn val :: ks }
+         | .evalFn rhs => 
+           match val with
+           | .lam _ body =>
+              modify fun s => { s with cur? := .inl <| subst body rhs.toExpr, stack := ks }
            | _ => modify fun s => { s with error? := "expected lambda, found non-lambda on the stack" }
-         | (.evalCast t, v) =>
-             match v.tryCast t with
-             | .some v' => sorry -- TODO: what to do with lambdas?
-             | .none => sorry
-
+         | .evalCast t =>
+             match val.tryCast? t with
+             | .inl e => modify fun s => { s with error? := .some e }
+             | .inr v => modify fun s => { s with cur? := .inr v, stack := ks } 
+end Eval
 end Gradual
 def foo : IO Unit := return ()
